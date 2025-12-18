@@ -723,6 +723,68 @@ class NegativeBinomialMixture(Distribution):
         return self.__class__.__name__ + "(" + args_string + ")"
 
 
+class LogNormalMixture(Distribution):
+    """Mixture of two log-normal distributions for continuous-valued observations."""
+
+    arg_constraints = {
+        "mean1": constraints.real,
+        "mean2": constraints.real,
+        "sigma1": constraints.greater_than_eq(0.0),
+        "sigma2": constraints.greater_than_eq(0.0),
+        "mixture_logits": constraints.real,
+    }
+    support = constraints.positive
+
+    def __init__(
+        self,
+        mean1: torch.Tensor,
+        sigma1: torch.Tensor,
+        mean2: torch.Tensor,
+        sigma2: torch.Tensor,
+        mixture_logits: torch.Tensor,
+        validate_args: bool = False,
+    ):
+        # Broadcast all inputs to common shape
+        self.mean1, self.sigma1, self.mean2, self.sigma2, self.mixture_logits = \
+            broadcast_all(mean1, sigma1, mean2, sigma2, mixture_logits)
+        super().__init__(validate_args=validate_args)
+
+    @property
+    def mixture_probs(self) -> torch.Tensor:
+        return logits_to_probs(self.mixture_logits, is_binary=True)
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        # Enforce support
+        try:
+            self._validate_sample(value)
+        except ValueError:
+            warnings.warn(
+                "The value argument must be positive for LogNormalMixture",
+                UserWarning,
+            )
+        # Compute component log-densities
+        log_x = torch.log(value)
+        comp1 = torch.distributions.Normal(self.mean1, self.sigma1).log_prob(log_x) - log_x
+        comp2 = torch.distributions.Normal(self.mean2, self.sigma2).log_prob(log_x) - log_x
+        # Weighted log-sum-exp
+        pi = self.mixture_probs
+        logp1 = torch.log(pi + 1e-8) + comp1
+        logp2 = torch.log(1 - pi + 1e-8) + comp2
+        return torch.logsumexp(torch.stack([logp1, logp2], dim=0), dim=0)
+
+    @torch.inference_mode()
+    def sample(self, sample_shape: tuple | torch.Size = None) -> torch.Tensor:
+        "Sample from the mixture of log-normals."  
+        sample_shape = sample_shape or torch.Size()
+        pi = self.mixture_probs
+        mixing = torch.distributions.Bernoulli(pi).sample(sample_shape)
+        # Expand parameters
+        mu = mixing * self.mean1 + (1 - mixing) * self.mean2
+        sigma = mixing * self.sigma1 + (1 - mixing) * self.sigma2
+        # Sample log-normal
+        return torch.exp(torch.distributions.Normal(mu, sigma).rsample())
+
+
 if is_package_installed("numpyro") and is_package_installed("jax"):
     import numpyro.distributions as dist
 
